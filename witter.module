@@ -1,0 +1,296 @@
+<?php
+/**
+ * Provide API for submitting comments.
+ */
+function witter_menu() {
+  $items = [
+    'witter/%'=> [
+      'page callback' => 'witter_comment_api',
+      'page arguments' => [1],
+      'access callback' => TRUE,
+      'cache' => DRUPAL_NO_CACHE,
+      'type' => MENU_NORMAL_ITEM,
+    ],
+  ];
+  return $items;
+}
+/**
+ * Add witter js to node with comments.
+ */
+function witter_preprocess_page(&$variables) {
+}
+
+/**
+ * Add the nid somewhere we can find.
+ */
+function witter_preprocess_node(&$variables) {
+  global $user;
+  $variables['attributes_array']['data-witter-nid'] = $variables['node']->nid;
+  $variables['attributes_array']['data-witter-name'] = $user->name;
+  $variables['content']['#attached']['js']['https://unpkg.com/vue'] = ['type' => 'external'];
+  $variables['content']['#attached']['js']['https://cdn.jsdelivr.net/npm/vue-resource@1.3.4'] = ['type' => 'external'];
+  // $variables['content']['#attached']['js']['https://cdn.jsdelivr.net/npm/lodash@4.17.4/lodash.min.js'] = ['type' => 'external'];
+  $variables['content']['#attached']['js'][drupal_get_path('module', 'witter') . '/js/witter.js'] = [];
+  $variables['content']['#attached']['css'][drupal_get_path('module', 'witter') . '/css/witter.css'] = [];
+
+}
+
+function witter_preprocess_comment(&$variables) {
+  global $user;
+  if (!empty($variables['comment']->field_comment_location['und'][0]['safe_value'])) {
+    $variables['attributes_array']['data-witter-location'] = $variables['comment']->field_comment_location['und'][0]['safe_value'];
+  }
+  $variables['attributes_array']['data-witter-who'] = $variables['comment']->name;
+  $variables['attributes_array']['data-witter-cid'] = $variables['comment']->cid;
+  $variables['attributes_array']['data-witter-own'] = ($variables['comment']->uid == $user->uid) ? 1 : 0;
+}
+
+// Page callbacks.
+function witter_comment_api($nid) {
+  WitterApi::factory($nid, $_SERVER['REQUEST_METHOD'], $_GET, file_get_contents('php://input'))
+    ->route();
+}
+class WitterApi
+{
+  /**
+   * Object Node.
+   */
+  public $node;
+
+  /**
+   * int nid.
+   */
+  public $nid;
+
+  /**
+   * String
+   */
+  public $location;
+
+  /**
+   * Request data
+   */
+  public $request_body;
+
+  /**
+   * Response code.
+   */
+  public $response_code = 200;
+
+  /**
+   * Response data
+   */
+  public $response_data;
+
+  /**
+   * Create object
+   */
+  public static function factory($nid, $method, $query, $input) {
+    $obj = new static($nid, $method, $query, $input);
+    return $obj;
+  }
+  /**
+   * Constructor
+   */
+  public function __construct($nid, $method, $query, $input) {
+    $this->nid = $nid;
+    $this->request_method = $method;
+    $this->request_query = $query;
+    $this->request_body = json_decode($input);
+  }
+  /**
+   * Route
+   */
+  public function route() {
+    try {
+      if ($this->request_method == 'GET') {
+        $this->handleGetRequest();
+      }
+      elseif ($this->request_method == 'POST') {
+        $this->handlePostRequest();
+      }
+      else {
+        throw new WitterException("Invalid call", 400);
+      }
+    }
+    catch (WitterException $e) {
+      $this->response_code = $e->getCode();
+      $this->response_data = ['error' => $e->getMessage()];
+    }
+    $this->sendResponse();
+  }
+  /**
+   * Handle a POST request.
+   *
+   * @param object $request_body
+   */
+  public function handlePostRequest() {
+
+    if (!$this->request_body || !isset($this->request_body->op)) {
+      throw new WitterException("Invalid request", 400);
+    }
+    elseif ($this->request_body->op == 'add') {
+      $this->addComment();
+    }
+    elseif ($this->request_body->op == 'delete') {
+      $this->deleteComment();
+    }
+    else {
+      throw new WitterException("Invalid operation", 400);
+    }
+  }
+  /**
+   * Handle a GET request.
+   *
+   * @param object $request_body
+   */
+  public function handleGetRequest() {
+
+    if (!$this->request_query || !isset($this->request_query['op'])) {
+      throw new WitterException("Invalid operation.", 400);
+    }
+    elseif ($this->request_query['op'] == 'reload') {
+      $this->reloadComments();
+    }
+    else {
+      throw new WitterException("Invalid operation.", 400);
+    }
+  }
+  /**
+   * Get node.
+   */
+  public function getNode() {
+    if ($this->node == null) {
+      if (!empty($this->nid)) {
+        $this->node = node_load($this->nid);
+      }
+    }
+    if (!$this->node || !node_access('view', $this->node)) {
+      throw new WitterException("You do not have permission to comment here.", 400);
+    }
+    return $this->node;
+  }
+  /**
+   * Set location string.
+   * @param string.
+   */
+  public function setLocation($location) {
+    $this->location = $location;
+    return $this;
+  }
+  /**
+   * Send the response and exit.
+   */
+  public function sendResponse() {
+    $output = json_encode($this->response_data);
+    if ($this->response_code != 200) {
+      header("$_SERVER[SERVER_PROTOCOL] $this->response_code");
+    }
+    header('Content-type: application/json');
+    header('Content-length: ' . strlen($output));
+    print $output;
+    drupal_exit();
+  }
+  /**
+   * Add a comment.
+   */
+  public function addComment() {
+    global $user;
+
+    if (!user_access('post comments')) {
+      throw new WitterException("You do not have permission to comment here.", 400);
+    }
+    $node = $this->getNode();
+    if (empty($this->request_body->location)) {
+      throw new WitterException("Invalid comment location", 400);
+    }
+
+    if (empty($this->request_body->comment)) {
+      // silently ignore.
+      throw new WitterException("Empty comment", 200);
+    }
+
+    // User is allowed to post comments here.
+    $comment = (object) [
+      'nid' => $node->nid,
+      'cid' => 0,
+      'pid' => 0,
+      'uid' => $user->uid,
+      'mail' => '',
+      'is_anonymous' => 0,
+      'homepage' => '',
+      'status' => COMMENT_PUBLISHED,
+      'subject' => '',
+      'language' => LANGUAGE_NONE,
+      'comment_body' => [
+        LANGUAGE_NONE => [
+          0 => [ 'value' => $this->request_body->comment, 'format' => 'plain_text' ]
+        ]
+      ],
+      'field_comment_location' => [LANGUAGE_NONE => [['value' => check_plain($this->request_body->location), 'format' => 'plain_text']]],
+    ];
+    comment_submit($comment);
+    comment_save($comment);
+    $comment = comment_load($comment->cid);
+
+    $this->response_data = ['text' => $comment->comment_body[LANGUAGE_NONE][0]['safe_value'],
+      'who' => $user->name, 'own' => true, 'cid' => (int) $comment->cid];
+  }
+  /**
+   * Delete a comment.
+   */
+  public function deleteComment() {
+    global $user;
+
+    $node = $this->getNode();
+
+    if (empty($this->request_body->cid)) {
+      $this->response_data = ['error' => 'Invalid comment ID'];
+      $this->response_code = 400;
+      return;
+    }
+    $comment = comment_load($this->request_body->cid);
+    if (!$comment) {
+      $this->response_data = ['error' => 'Invalid comment ID'];
+      $this->response_code = 400;
+      return;
+    }
+
+    if (node_access('view', $node) && user_access('edit own comments')
+      && ($user->uid == 1 || ($user->uid == $comment->uid))) {
+      // User is allowed to view this node, edit their own comments, and this
+      // is their comment (or they are user 1).
+      comment_delete($comment->cid);
+      $this->response_data = ['success' => true];
+    }
+    else {
+      $this->response_data = ['error' => 'You do not have permission to delete this comments.'];
+      $this->response_code = 401;
+      return;
+    }
+  }
+  /**
+   * Reload comments for this node.
+   */
+  public function reloadComments() {
+    global $user;
+    $node = $this->getNode();
+    $comments = comment_load_multiple(comment_get_thread($node, COMMENT_MODE_FLAT, 100000));
+    $this->response_data = ['comments' => []];
+    foreach ($comments as $comment) {
+      if (!empty($comment->field_comment_location['und'][0]['safe_value'])) {
+        $location = $comment->field_comment_location['und'][0]['safe_value'];
+        if (!isset($this->response_data['comments'][$location])) {
+          $this->response_data['comments'][$location] = [];
+        }
+        $this->response_data['comments'][$location][] = [
+            'who' => $comment->name,
+            'own' => $comment->uid == $user->uid,
+            'text' => $comment->comment_body['und'][0]['safe_value'],
+            'cid' => (int) $comment->cid,
+          ];
+      }
+    }
+  }
+}
+class WitterException extends Exception {}

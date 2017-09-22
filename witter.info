@@ -1,0 +1,4 @@
+name = Witter
+description = Allow commenting on certain parts of page.
+core = 7.x
+files []= witter.module
